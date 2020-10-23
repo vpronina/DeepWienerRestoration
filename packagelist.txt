@@ -1,0 +1,7 @@
+matplotlib
+numpy
+Pillow
+scikit-image>0.14
+scipy
+pytorch>=1.6.0
+tqdm
