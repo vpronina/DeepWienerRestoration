@@ -806,6 +806,118 @@ def imfilter2D_SpatialDomain(input,kernel,padType="symmetric",mode="conv"):
 
     return out       
 
+def odctdict(n,L,dtype = 'f',GPU = False):
+    D = torch.zeros(n,L)
+    if dtype == 'f':
+        D = D.float()
+    else:
+        D = D.double()
+    
+    D[:,0] = 1/math.sqrt(n)
+    for k in range(1,L): 
+        v = torch.cos(th.arange(0,n)*math.pi*k/L); 
+        v -= v.mean();
+        D[:,k] = v.div(v.norm(p=2))
+    
+    if torch.cuda.is_available() and GPU:
+        D = D.cuda()
+    
+    return D
+
+def odctndict(n,L,p = None, dtype = 'f', GPU = False):
+    r"""  D = ODCTNDICT((N1 N2 ... Np),(L1 L2 ... Lp)) returns an overcomplete 
+    DCT dictionary for p-dimensional signals of size N1xN2x...xNp. The number 
+    of DCT atoms in the i-th dimension is Li, so the combined dictionary is of
+    size (N1*N2*...*Np) x (L1*L2*...*Lp).
+
+    D = ODCTNDICT([N1 N2 ... Np],L) specifies the total number of atoms in
+    the dictionary instead of each of the Li's individually. The Li's in
+    this case are selected so their relative sizes are roughly the same as
+    the relative sizes of the Ni's. Note that the actual number of atoms in
+    the dictionary may be larger than L, as rounding might be required for
+    the computation of the Li's.
+
+    D = ODCTNDICT(N,L,P) is shorthand for the call ODCTNDICT(N*ones(1,P),L),
+    and returns the overcomplete DCT dictionary for P-dimensional signals of
+    size NxNx...xN. L is the required size of the overcomplete dictionary,
+    and is rounded up to the nearest integer with a whole P-th root.
+    """
+    assert(isinstance(n,int) or isinstance(n,tuple)), " n should be either of "\
+    "type int or of type tuple."
+    assert(isinstance(L,int) or isinstance(L,tuple)), " L should be either of "\
+    "type int or of type tuple."
+    assert(isinstance(p,int) or p is None), " p should be either of "\
+    "type int or being omitted."
+         
+    n = np.asarray(n)
+    L = np.asarray(L)
+
+    if p is None:
+        p = n.size
+
+    if n.size == 1 :
+        n = n*np.ones((1,p))
+    if L.size == 1 :
+        L = L*np.ones((1,))
+        
+
+    if L.size ==1 and p > 1 :
+        N = np.prod(n)
+        L = np.ceil((L*(np.power(n,p)/N)**(1/(p-1)))**(1/p))
+    
+    n = tuple(int(i) for i in n)
+    L = tuple(int(i) for i in L)
+    
+    D = odctdict(n[0],L[0],dtype,GPU)
+    for i in range(1,p):
+        D = kron(D,odctdict(n[i],L[i],dtype,GPU))
+    
+    return D
+
+def odct2dict(n,L,dtype = 'f', GPU = False):
+    return odctndict(n,L,2,dtype,GPU)
+
+def odct3dict(n,L,dtype = 'f', GPU = False):
+    return odctndict(n,L,3,dtype,GPU)
+
+def kron(x,y):
+    r""" Kronecker tensor product.
+    KRON(X,Y) is the Kronecker tensor product of X and Y.
+    The result is a large matrix formed by taking all possible
+    products between the elements of X and those of Y. For
+    example, if X is 2 by 3, then KRON(X,Y) is
+ 
+       [ X[0,0]*Y  X[0,1]*Y  X[0,2]*Y
+         X[1,0]*Y  X[1,1]*Y  X[1,2]*Y ]
+    """
+    assert(x.dim() == 1 or x.dim() == 2), "x must be either a 1D or 2D tensor."
+    assert(y.dim() == 1 or y.dim() == 2), "x must be either a 1D or 2D tensor."
+    
+    if x.dim() == 1:
+        x = x.unsqueeze(1)
+    if y.dim() == 1:
+        y = y.unsqueeze(1)
+    
+    x_size = x.shape
+    y_size = y.shape
+    
+    x = x.t().contiguous().view(-1)
+    y = y.t().contiguous().view(-1)
+    
+    z = y.ger(x)
+    
+    D = torch.Tensor().type_as(x)
+    for m in range(0,x_size[1]):
+        d = torch.Tensor().type_as(x)
+        for k in range(x_size[0]*m,x_size[0]*(m+1)):
+            d = torch.cat((d,z[:,k].contiguous().view(y_size[1],y_size[0]).t()),dim=0)
+        if m == 0:
+            D = torch.cat((D,d))
+        else:
+            D = torch.cat((D,d),dim=1)
+    
+    return D
+
 def dct(tensor):
     """
     Function to initialize the input tensor with weights from the dct basis or dictionary.
