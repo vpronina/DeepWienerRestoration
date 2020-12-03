@@ -2,7 +2,7 @@
 
 Implementation of the joint deblurring and denoising of microscopy images distorted with Gaussian or Poisson noise as described in the paper **"Microscopy Image Restoration with Deep Wiener-Kolmogorov Filters" (ECCV2020)**.
 
-[Project page](https://vpronina.github.io/resources/index.htm)
+[Project page](https://vpronina.github.io/resources/project.htm)
 
 ### Dependencies
 
