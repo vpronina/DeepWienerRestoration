@@ -76,6 +76,10 @@ optional arguments:
                         simulate various levels of Poisson noise
                         
 ```
+## Training and validation data
+
+Data for training and validation and corresponding PSFs are available via the following link:
+https://drive.google.com/drive/folders/1oPFbYBHv-R4sgtnQwrEun1V5EDbKQa1H?usp=sharing
 
 ## Note
 
