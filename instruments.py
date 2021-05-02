@@ -18,7 +18,15 @@ def model_load(noise_mode, method, model_path):
         
     if method == 'WF_UNet':
         model_name = 'WF_UNet_' + str(noise_mode)
-        model = WienerFilter_UNet()   
+        model = WienerFilter_UNet() 
+        
+    if method == 'WF_KPN_SA':
+        model_name = 'WF_KPN_SA_' + str(noise_mode)
+        
+        if noise_mode=='gaussian':
+            model = Wiener_KPN_SA(maxiter=250, tol=1e-6) 
+        if noise_mode == 'poisson':
+            model = Wiener_KPN_SA(maxiter=200, tol=1e-4) 
 
     state_dict = torch.load(os.path.join(model_path, model_name))
 

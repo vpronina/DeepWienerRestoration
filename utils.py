@@ -1012,7 +1012,7 @@ def exact_unbiased(z):
             (5.0/8.0) * math.sqrt(3.0/2.0) * z.pow(-3) - (1.0 / 8.0))
 
 
-def pad_psf_shape(imgs, kernels):
+def pad_psf_shape(imgs, kernels, pad_k=None):
     """
     Function to perform a 2D replication padding of images with the size corresponding to PSF size.
 
@@ -1162,3 +1162,252 @@ def get_image_grad(x):
     x_ = F.pad(x, (0, 0, 1, 1), 'reflect')
     grad_y = F.conv2d(x_, torch.stack([weights.transpose(0, 1)[None]] * x.shape[1]), groups=x.shape[1])
     return grad_x, grad_y
+
+
+def vnorm_b(x):
+    r"""returns the 2-norm of a vector.
+    """
+    assert torch.is_tensor(x), "Only tensor inputs are supported"
+    b = x.shape[0]
+    return x.reshape(b, -1).norm(p=2, dim=1)
+
+
+def vdot_b(x, y):
+    """ returns the vector product of x, y."""
+    assert torch.is_tensor(x) and torch.is_tensor(y), "Only tensor inputs are supported."
+    b = x.shape[0]
+    return (x.reshape(b, -1) * y.reshape(b, -1)).sum(dim=1)
+
+
+def cg_solver_b(A, filters_out, reg_weight, b, x=None, M=None, maxiter=50, tol=1e-1, restart=50, info=None):
+    r"""Conjugate Gradient method for solving the problem Ax = b.
+    Parameters
+    ----------
+    A : function.
+        Function that performs the linear operation A(x).
+    b : torch.(cuda.)Tensor
+        The solution of the linear system Ax = b.
+    x : torch.(cuda.)Tensor
+        Initial solution of the system. (Default: None)
+    M : function.
+        Function that performs precondtioning M(x).
+
+    maxiter : int, optional.
+              Maximum number of iterations. (Default: 100)
+    tol : float, optional.
+          Stopping threshold. (Default: 1e-1)
+    restart : int, optional.
+              Indicates the frequency of computing the residual as
+              r[k] = b - A(x[k]) instead of the recursion formula
+              r[k] = r[k-1] - alpha*A(r[k-1]). (Default: 50)
+    Returns
+    -------
+    x : torch.(cuda.)Tensor
+        The estimate of the solution of the linear system
+    iter : int
+        The number of CG iterations that run.
+    alpha : float
+        Last the computed step size alpha
+    info : dict
+        dictionary with iteration information
+    """
+    if x is None:
+        x = torch.zeros_like(b)
+    r = b - A(x, filters_out, reg_weight)  # residual
+    if M is None:
+        d = r
+        delta = vnorm_b(r) ** 2
+    else:
+        d = M(r)
+        delta = vdot_b(r, d)
+    threshold = tol * delta
+
+    # prepare info
+
+    info = {'res': torch.zeros(maxiter, x.shape[0], dtype=x.dtype, device=x.device),
+            'inires': torch.sqrt(delta),
+            'converged': torch.zeros(x.shape[0], device=x.device).bool(),
+            'cg_iter': -1}
+
+    converged_mask = torch.zeros(x.shape[0], device=x.device).bool()
+    if (delta <= threshold).any():
+        converged_mask = delta <= threshold
+        info['converged'][converged_mask] = True
+    cg_iter = maxiter
+
+    for i in range(maxiter):
+
+        q = A(d, filters_out, reg_weight)
+
+        alpha = delta / vdot_b(d, q)
+        alpha[converged_mask] = 0
+
+        x = x + alpha[:, None] * d * (~converged_mask[:, None])
+
+        if ((i + 1) % restart) == 0:
+            r = b - A(x, filters_out, reg_weight)
+        else:
+            r = r - alpha[:, None] * q
+
+        delta_old = delta
+
+        if M is None:
+            delta = vnorm_b(r) ** 2
+        else:
+            s = M(r)
+            delta = vdot_b(r, s)
+
+        info['res'][i, ~converged_mask] = torch.sqrt(delta[~converged_mask])
+        if (delta < threshold).any():
+            cg_iter = i + 1
+
+            converged_mask = converged_mask | (delta <= threshold)
+            info['converged'][converged_mask] = True
+
+            if info['converged'].all():
+                break
+
+        if M is None:
+            d = r + (delta / delta_old)[:, None] * d
+        else:
+            d = s + (delta / delta_old)[:, None] * d
+
+    info['cg_iter'] = cg_iter
+    info['res'] = info['res'][:cg_iter]
+    return x, info
+
+class ConugateGradient_Function(torch.autograd.Function):
+    '''
+    Class that implements forward and backward operations for conjugate gradient algorithm
+    '''
+    @staticmethod
+    def forward(ctx, A_f, filters_out, reg_weight, b, x0=None, M=None, maxiter=50, tol=1e-2, restart=50):
+        '''
+        Parameters
+        ----------
+        A_f : function.
+            Function that performs the linear operation A(x).
+        filters_out : torch.(cuda.)Tensor
+            Predicted kernels per-pixel
+        reg_weight : torch.(cuda.)Tensor
+            Balance parameter for optimization scheme
+        b : torch.(cuda.)Tensor
+            The solution of the linear system Ax = b.
+        x : torch.(cuda.)Tensor
+            Initial solution of the system. (Default: None)
+        M : function.
+            Function that performs precondtioning M(x).
+
+        maxiter : int, optional.
+                  Maximum number of iterations. (Default: 100)
+        tol : float, optional.
+              Stopping threshold. (Default: 1e-1)
+        restart : int, optional.
+                  Indicates the frequency of computing the residual as
+                  r[k] = b - A(x[k]) instead of the recursion formula
+                  r[k] = r[k-1] - alpha*A(r[k-1]). (Default: 50)
+        Returns
+        -------
+        x : torch.(cuda.)Tensor
+            The estimate of the solution of the linear system
+        cg_info['res'] : torch.(cuda.)Tensor
+            Estimated residual
+        cg_info['res'] : bool
+            Information about convergence of the update scheme
+        '''
+        
+        x, cg_info = cg_solver_b(A_f, filters_out, reg_weight, b, x=x0, M=M, maxiter=maxiter, tol=tol, restart=restart)
+        info = cg_info
+        ctx.info = cg_info
+        ctx.A_f = A_f
+        ctx.filters_out = filters_out
+        ctx.reg_weight = reg_weight
+        ctx.b = b
+        ctx.x = x.detach()
+        ctx.x0 = x0
+        ctx.M = M
+        ctx.maxiter = maxiter
+        ctx.tol = tol
+        ctx.restart = restart
+        return x, cg_info['res'], cg_info['converged']
+
+    @staticmethod
+    def backward(ctx, grad_output, nonused1, nonused2):
+        # Return as many input gradients as there are arguments.
+        # Gradients of non-Tensor arguments to forward must be None.
+        info = None
+        if grad_output.sum() == 0:
+            grad_over_b = torch.zeros_like(grad_output)
+        else:
+            with torch.no_grad():
+                grad_over_b, cg_info = cg_solver_b(ctx.A_f, ctx.filters_out, ctx.reg_weight, \
+                                                   grad_output, x=None, M=ctx.M, maxiter=ctx.maxiter, tol=ctx.tol, restart=ctx.restart)
+
+        with torch.enable_grad():
+            foo_inp = ctx.x.clone().detach()
+            foo_inp.requires_grad = True
+            filters_out = ctx.filters_out.clone().detach().requires_grad_(True)
+            reg_weight = ctx.reg_weight.clone().detach().requires_grad_(True)
+            foo_inp = ctx.A_f(foo_inp, filters_out, reg_weight, create_graph=True, retain_graph=True)
+            grad_over_ = torch.autograd.grad(foo_inp, [filters_out, reg_weight], grad_outputs=-grad_over_b,
+                                             create_graph=True, retain_graph=True, allow_unused=False)
+            grad_over_fo = grad_over_[0]
+            grad_over_rw = grad_over_[1]
+
+            del foo_inp
+        if ctx.x0 is not None:
+            grad_over_x0 = torch.zeros_like(grad_output)
+        else:
+            grad_over_x0 = None
+        del ctx.b, ctx.x0, ctx.A_f, ctx.M, nonused1, nonused2, ctx.x, ctx.maxiter, ctx.tol, ctx.restart, ctx.info
+        torch.cuda.empty_cache()
+        return None, grad_over_fo, grad_over_rw, grad_over_b, grad_over_x0, None, None, None, None
+
+class Im2Col(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, kernel_size, padding):
+        ctx.shape, ctx.kernel_size, ctx.padding = (x.shape[2:], kernel_size, padding)
+        return F.unfold(x, kernel_size=kernel_size, padding=padding)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        with torch.enable_grad():
+            shape, ks, padding = ctx.shape, ctx.kernel_size, ctx.padding
+            return (
+                F.fold(grad_output, shape, kernel_size=ks, padding=padding),
+                None,
+                None,
+            )
+
+
+def im2col(x, kernel_size, padding):
+    return Im2Col.apply(x, kernel_size, padding)
+
+def spatial_conv(x, kernels):
+    '''
+    Function that calculates spatially varying convolution for a batch
+    
+    Parameters:
+    -----------
+    
+    x (torch.(cuda.)Tensor): Input image B x C x H x W
+    kernels (torch.(cuda.)Tensor): Predicted per-pixel filters (kernels) B x C x C x Hg x Wg x H x W
+    return (torch.(cuda.)Tensor): Result of spatially varying convolution B x C x H x W
+    '''
+    batch, C, H, W = x.shape
+    kern_supp = kernels.shape[3]
+    padding = kern_supp // 2
+    kernels = kernels.reshape(batch, kernels.shape[3]*kernels.shape[3], -1).transpose(1, 2) 
+    out = []
+    for c in range(x.shape[1]):
+        inp_unf = im2col(x[:, c][:, None], (kern_supp, kern_supp), padding=padding)
+        b, c_, pix = inp_unf.shape
+        inp_unf = inp_unf.transpose(1, 2).reshape(b * pix, c_)
+        kernels = kernels.reshape(b * pix, c_)
+        filtered_inp_unf = inp_unf[:, None].bmm(kernels[..., None])
+        filtered_inp_unf = filtered_inp_unf.reshape(b, pix)
+        filtered_inp_unf = filtered_inp_unf.reshape(batch, C, int(np.sqrt(pix)), int(np.sqrt(pix)))
+        out.append(filtered_inp_unf)
+
+    out = torch.cat(out, dim=1)
+    return out

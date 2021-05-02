@@ -128,3 +128,60 @@ class WienerFilter_UNet(nn.Module):
             output = self.function(output, y, ker)
 
         return output
+    
+class Wiener_KPN_SA(nn.Module):
+    '''
+    Module that uses UNet to predict individual per-pixel kernels for each input image and then
+    applies conjugate gradient scheme for solution
+    '''
+    def __init__(self, maxiter=300, tol=1e-6, restart=50):
+        super(Wiener_KPN_SA, self).__init__()
+        self.maxiter = maxiter
+        self.tol = tol
+        self.restart = restart
+        self.cg_solver = utils.ConugateGradient_Function
+        self.info = None
+
+        self.reg_weight = nn.Parameter(torch.Tensor([0.]))
+        self.model = UNet(mode='none', n_channels=1, n_classes=9)
+
+    def forward(self, y, k, x0=None, M_f=None):
+        '''
+        y:  (torch.(cuda.)Tensor) Tensor of input images of shape B x C x H x W
+        k:  (torch.(cuda.)Tensor) Tensor of PSFs of shape B x C x Hk x Wk
+        x0: (torch.(cuda.)Tensor) Initial solution of the system. (Default: None)
+        M:  Function that performs precondtioning M(x).
+        returns: (torch.(cuda.)Tensor) Output of the conjugate gradient scheme B x C x H x W
+        '''
+        
+        B, C, H, W = y.shape
+        # predict regularization filters and perform their normalization
+        filters_out = self.model(y)
+        filters_out_ = filters_out.reshape(B, C, -1, H, W)
+        filters_out__ = F.normalize(filters_out_, dim=2, p=1)
+        filters_out___ = filters_out__.reshape(B, C, C, 3, 3, H, W)
+
+        b = utils.imfilter_transpose2D_SpatialDomain(y, k, padType='symmetric', mode="conv").reshape(B, -1)
+        b = b.requires_grad_(True)
+
+
+        # func = 0.5||y - Kx||2_2 + 0.5exp(a)||Gx||2_2
+        @torch.enable_grad()
+        def func(x, k, filters_out, reg_weight, y):  
+            x = x.reshape(B, C, H, W)
+            k_x = utils.imfilter2D_SpatialDomain(x, k, padType='symmetric', mode="conv")
+            k_x = k_x.reshape(B, -1)
+            l_x = utils.spatial_conv(x, filters_out).reshape(B, -1)
+            return 0.5 * torch.norm(y.reshape(B, -1) - k_x, dim=1, p=2) ** 2 + 0.5 * torch.exp(reg_weight) * torch.norm(l_x, dim=1, p=2) ** 2
+
+        def grad_func(x, filters_out, reg_weight, create_graph=False, retain_graph=False):
+            x = x.requires_grad_(True)
+            out = func(x, k, filters_out, reg_weight, y)
+            grad = torch.autograd.grad(out, x, grad_outputs=torch.ones_like(out), create_graph=create_graph, retain_graph=retain_graph)[0]
+            k_y = utils.imfilter_transpose2D_SpatialDomain(y, k, padType='symmetric', mode="conv")
+            return grad + k_y.reshape(B, -1)
+
+        x, res, converged = self.cg_solver.apply(grad_func, filters_out___, self.reg_weight, b, x0, M_f, self.maxiter, self.tol, self.restart)
+        info = {'res': res, 'converged': converged}
+
+        return x.reshape(B, C, H, W).float()
